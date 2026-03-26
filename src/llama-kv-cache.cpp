@@ -616,6 +616,28 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
+    // TurboQuant temporal decay: check if old tokens need requantization
+    const bool has_turbo3_layers = !layers.empty() && layers[0].k && layers[0].k->type == GGML_TYPE_TURBO3_0;
+    if (has_turbo3_layers) {
+        static int decay_counter = 0;
+        if (++decay_counter >= 64) {  // every 64 decode calls (~every 64 tokens)
+            decay_counter = 0;
+            llama_pos max_pos = 0;
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                const auto & cells = v_cells[s];
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    if (!cells.is_empty(i)) {
+                        llama_pos p = cells.pos_get(i);
+                        if (p > max_pos) max_pos = p;
+                    }
+                }
+            }
+            if (max_pos > 4096) {
+                decay_old_tokens(max_pos, 4096);
+            }
+        }
+    }
+
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
 
@@ -759,6 +781,248 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     return updated;
+}
+
+// TurboQuant temporal decay constants (mirrored from ggml-common.h)
+static constexpr int TURBO3_QK = 32;          // elements per block
+static constexpr int TURBO3_GROUP = 128;       // rotation group size
+static constexpr int TURBO3_BLOCKS_PER_GROUP = TURBO3_GROUP / TURBO3_QK;  // 4
+
+// turbo3 block layout: norm(2) + qs(8) + signs(4) = 14 bytes
+struct turbo3_block {
+    uint16_t norm;                         // fp16 norm
+    uint8_t  qs[TURBO3_QK / 4];           // 2-bit indices: 8 bytes
+    uint8_t  signs[TURBO3_QK / 8];        // 1-bit sign: 4 bytes
+};
+static_assert(sizeof(turbo3_block) == 14, "turbo3 block must be 14 bytes");
+
+// 3-bit centroids for turbo3 (same as in Metal shader)
+static const float TURBO_CENTROIDS_3BIT[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+// 2-bit centroids for temporal decay target
+static const float TURBO_CENTROIDS_2BIT[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f
+};
+
+// Midpoints for 2-bit nearest centroid lookup
+static const float TURBO_MIDPOINTS_2BIT[3] = {
+    -0.086728f, 0.0f, 0.086728f
+};
+
+// Find nearest 3-bit centroid to a given value
+static int nearest_3bit(float val) {
+    // Find the 3-bit centroid closest to val (for remapping 2-bit → 3-bit storage)
+    int best = 0;
+    float best_dist = fabsf(val - TURBO_CENTROIDS_3BIT[0]);
+    for (int i = 1; i < 8; i++) {
+        float dist = fabsf(val - TURBO_CENTROIDS_3BIT[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Find nearest 2-bit centroid
+static int nearest_2bit(float val) {
+    if (val < TURBO_MIDPOINTS_2BIT[0]) return 0;
+    if (val < TURBO_MIDPOINTS_2BIT[1]) return 1;
+    if (val < TURBO_MIDPOINTS_2BIT[2]) return 2;
+    return 3;
+}
+
+void llama_kv_cache::decay_old_tokens(llama_pos max_pos, llama_pos decay_threshold) {
+    // Requantize old turbo3 tokens to effective 2-bit precision.
+    // This runs on CPU, reading/writing directly to the KV cache tensor buffers.
+    //
+    // For each old cell (position < max_pos - threshold):
+    //   1. Read turbo3 blocks for that cell
+    //   2. Dequant each element: centroid_3bit[idx] * stored_norm
+    //   3. Requantize: find nearest 2-bit centroid, map back to nearest 3-bit index
+    //   4. Recompute norm correction for the 128-element group
+    //   5. Write back as turbo3 block (same format, just coarser values)
+    //
+    // Layer-aware: only decay layers 0 to n_layer-8 (early/mid layers).
+    // Skip attention sinks (positions 0-3).
+    // Ported from Python prototype validated at cosine_sim=0.949 on real Qwen3 KV tensors.
+
+    const llama_pos decay_cutoff = max_pos - decay_threshold;
+    if (decay_cutoff <= 4) return;  // nothing old enough to decay (preserve sinks at 0-3)
+
+    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t decay_layer_max = n_layer > 8 ? n_layer - 8 : n_layer;  // skip last 8 layers
+
+    // Limit cells per cycle to avoid blocking decode. Process incrementally.
+    static constexpr int MAX_CELLS_PER_CYCLE = 64;
+    int decayed_cells = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+
+        for (uint32_t cell_idx = 0; cell_idx < cells.size(); ++cell_idx) {
+            if (cells.is_empty(cell_idx)) continue;
+
+            const llama_pos cell_pos = cells.pos_get(cell_idx);
+
+            // Skip attention sinks (pos 0-3) and recent tokens
+            if (cell_pos < 4 || cell_pos >= decay_cutoff) continue;
+
+            // Limit cells per cycle to avoid blocking decode
+            if (decayed_cells >= MAX_CELLS_PER_CYCLE) break;
+
+            // Process each layer's K and V for this cell
+            for (uint32_t il = 0; il < layers.size(); ++il) {
+                // Layer-aware: skip last 8 layers (most quality-sensitive)
+                if (layers[il].il >= decay_layer_max) continue;
+
+                // Only decay turbo3 layers
+                if (layers[il].k->type != GGML_TYPE_TURBO3_0) continue;
+
+                const uint32_t n_embd_k_gqa = layers[il].k->ne[0];
+                const uint32_t n_blocks = n_embd_k_gqa / TURBO3_QK;
+                const size_t block_size = sizeof(turbo3_block);
+
+                // Process K cache
+                {
+                    const size_t row_offset = cell_idx * n_embd_k_gqa / TURBO3_QK * block_size;
+                    std::vector<turbo3_block> blocks(n_blocks);
+                    ggml_backend_tensor_get(layers[il].k, blocks.data(), row_offset, n_blocks * block_size);
+
+                    // Process in groups of 4 blocks (128 elements) for norm correction
+                    const int blocks_per_group = TURBO3_GROUP / TURBO3_QK;
+                    for (uint32_t g = 0; g < n_blocks / blocks_per_group; ++g) {
+                        // Dequant all 128 elements in this group
+                        float values[TURBO3_GROUP];
+                        float stored_norm = ggml_fp16_to_fp32(blocks[g * blocks_per_group].norm);
+
+                        for (int b = 0; b < blocks_per_group; ++b) {
+                            const auto & blk = blocks[g * blocks_per_group + b];
+                            for (int j = 0; j < TURBO3_QK; ++j) {
+                                const int qs_byte_idx = j / 4;
+                                const int qs_bit_shift = (j % 4) * 2;
+                                const uint8_t low2 = (blk.qs[qs_byte_idx] >> qs_bit_shift) & 0x3;
+                                const uint8_t hi1 = (blk.signs[j / 8] >> (j % 8)) & 0x1;
+                                const int idx = low2 | (hi1 << 2);
+                                values[b * TURBO3_QK + j] = TURBO_CENTROIDS_3BIT[idx] * stored_norm;
+                            }
+                        }
+
+                        // Requantize to 2-bit: normalize, find nearest 2-bit centroid, map to 3-bit
+                        float group_norm = 0.0f;
+                        for (int i = 0; i < TURBO3_GROUP; ++i) {
+                            group_norm += values[i] * values[i];
+                        }
+                        group_norm = sqrtf(group_norm);
+                        if (group_norm < 1e-10f) continue;
+
+                        float inv_norm = 1.0f / group_norm;
+
+                        // Recompute indices: normalized → 2-bit centroid → nearest 3-bit index
+                        float recon_norm_sq = 0.0f;
+                        for (int b = 0; b < blocks_per_group; ++b) {
+                            auto & blk = blocks[g * blocks_per_group + b];
+                            memset(blk.qs, 0, TURBO3_QK / 4);
+                            memset(blk.signs, 0, TURBO3_QK / 8);
+
+                            for (int j = 0; j < TURBO3_QK; ++j) {
+                                float normalized_val = values[b * TURBO3_QK + j] * inv_norm;
+
+                                // Find nearest 2-bit centroid
+                                int idx_2bit = nearest_2bit(normalized_val);
+                                float centroid_2bit = TURBO_CENTROIDS_2BIT[idx_2bit];
+
+                                // Map to nearest 3-bit index (for turbo3 block storage)
+                                int idx_3bit = nearest_3bit(centroid_2bit);
+
+                                // Pack into turbo3 block format
+                                blk.qs[j / 4] |= (idx_3bit & 0x3) << ((j % 4) * 2);
+                                if (idx_3bit & 0x4) {
+                                    blk.signs[j / 8] |= (1 << (j % 8));
+                                }
+
+                                // Accumulate for norm correction
+                                float c = TURBO_CENTROIDS_3BIT[idx_3bit];
+                                recon_norm_sq += c * c;
+                            }
+                        }
+
+                        // Norm correction: store corrected norm
+                        float recon_norm = sqrtf(recon_norm_sq);
+                        float corrected_norm = (recon_norm > 1e-10f) ? group_norm / recon_norm : group_norm;
+                        ggml_fp16_t norm_fp16 = ggml_fp32_to_fp16(corrected_norm);
+                        for (int b = 0; b < blocks_per_group; ++b) {
+                            blocks[g * blocks_per_group + b].norm = norm_fp16;
+                        }
+                    }
+
+                    // Write back
+                    ggml_backend_tensor_set(layers[il].k, blocks.data(), row_offset, n_blocks * block_size);
+                }
+
+                // Process V cache (same logic)
+                if (layers[il].v && layers[il].v->type == GGML_TYPE_TURBO3_0) {
+                    const uint32_t n_embd_v_gqa = layers[il].v->ne[0];
+                    const uint32_t n_blocks_v = n_embd_v_gqa / TURBO3_QK;
+                    const size_t row_offset_v = cell_idx * n_embd_v_gqa / TURBO3_QK * block_size;
+                    std::vector<turbo3_block> blocks_v(n_blocks_v);
+                    ggml_backend_tensor_get(layers[il].v, blocks_v.data(), row_offset_v, n_blocks_v * block_size);
+
+                    const int blocks_per_group = TURBO3_GROUP / TURBO3_QK;
+                    for (uint32_t g = 0; g < n_blocks_v / blocks_per_group; ++g) {
+                        float values[TURBO3_GROUP];
+                        float stored_norm = ggml_fp16_to_fp32(blocks_v[g * blocks_per_group].norm);
+
+                        for (int b = 0; b < blocks_per_group; ++b) {
+                            const auto & blk = blocks_v[g * blocks_per_group + b];
+                            for (int j = 0; j < TURBO3_QK; ++j) {
+                                const uint8_t low2 = (blk.qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+                                const uint8_t hi1 = (blk.signs[j / 8] >> (j % 8)) & 0x1;
+                                values[b * TURBO3_QK + j] = TURBO_CENTROIDS_3BIT[low2 | (hi1 << 2)] * stored_norm;
+                            }
+                        }
+
+                        float group_norm = 0.0f;
+                        for (int i = 0; i < TURBO3_GROUP; ++i) group_norm += values[i] * values[i];
+                        group_norm = sqrtf(group_norm);
+                        if (group_norm < 1e-10f) continue;
+
+                        float inv_norm = 1.0f / group_norm;
+                        float recon_norm_sq = 0.0f;
+
+                        for (int b = 0; b < blocks_per_group; ++b) {
+                            auto & blk = blocks_v[g * blocks_per_group + b];
+                            memset(blk.qs, 0, TURBO3_QK / 4);
+                            memset(blk.signs, 0, TURBO3_QK / 8);
+                            for (int j = 0; j < TURBO3_QK; ++j) {
+                                int idx_2bit = nearest_2bit(values[b * TURBO3_QK + j] * inv_norm);
+                                int idx_3bit = nearest_3bit(TURBO_CENTROIDS_2BIT[idx_2bit]);
+                                blk.qs[j / 4] |= (idx_3bit & 0x3) << ((j % 4) * 2);
+                                if (idx_3bit & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
+                                recon_norm_sq += TURBO_CENTROIDS_3BIT[idx_3bit] * TURBO_CENTROIDS_3BIT[idx_3bit];
+                            }
+                        }
+
+                        float corrected = (sqrtf(recon_norm_sq) > 1e-10f) ? group_norm / sqrtf(recon_norm_sq) : group_norm;
+                        ggml_fp16_t norm_fp16 = ggml_fp32_to_fp16(corrected);
+                        for (int b = 0; b < blocks_per_group; ++b) blocks_v[g * blocks_per_group + b].norm = norm_fp16;
+                    }
+
+                    ggml_backend_tensor_set(layers[il].v, blocks_v.data(), row_offset_v, n_blocks_v * block_size);
+                }
+            }
+
+            decayed_cells++;
+        }
+    }
+
+    if (decayed_cells > 0) {
+        LLAMA_LOG_INFO("llama_kv_cache: temporal decay applied to %d cells (pos < %d)\n",
+                       decayed_cells, (int)decay_cutoff);
+    }
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {

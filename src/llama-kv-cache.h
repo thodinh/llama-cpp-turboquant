@@ -127,6 +127,10 @@ public:
 
     void clear(bool data) override;
 
+    // TurboQuant temporal decay: requantize old turbo3 tokens to effective 2-bit
+    // Called from update() periodically. Threshold = minimum token age for decay.
+    void decay_old_tokens(llama_pos max_pos, llama_pos decay_threshold = 4096);
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
