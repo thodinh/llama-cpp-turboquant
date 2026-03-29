@@ -1800,11 +1800,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
-    // TODO: TurboQuant pre-rotate-queries optimization (WIP — PPL 23.5 vs 6.19 target)
-    // The graph-side rotation approach works mechanically (ggml_mul_mat rotates correctly)
-    // but gives 4x worse PPL than dequant-side rotation for unknown reasons.
-    // Keeping dequant inverse rotation for now until this is resolved.
-    // See: docs/turbo-speed-investigation.md for full debugging history
+    // TurboQuant note: graph-side Q rotation (pre-rotate-queries) is implemented below
+    // in the flash-attn path. The VEC kernel bug (wrong Q/K stride in
+    // vec_dot_fattn_vec_KQ_turbo3_0) was fixed in fattn-common.cuh to match f16 pattern.
 
     ggml_tensor * cur;
 
@@ -1831,6 +1829,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+        // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
+        // Group size must come from K (which determines the WHT rotation), not V.
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const ggml_tensor * group_src = k_is_turbo ? k : v;
+            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (cur->ne[0] % turbo_group == 0) {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
+                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, innerq_scale);  // 1 = inverse
+            }
+        }
 
         if (v_mla) {
 #if 0
@@ -1898,6 +1910,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
 
+        // TurboQuant: inverse WHT on attention output (non-FA path)
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const ggml_tensor * group_src = k_is_turbo ? k : v;
+            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (kqv->ne[0] % turbo_group == 0) {
+                if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
+                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
+                kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group, innerq_scale);
+            }
+        }
+
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
@@ -1915,8 +1939,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
     }
 
-    // TODO: TurboQuant V inverse rotation (WIP — part of pre-rotate-queries optimization)
-    // See comment above for status
+    // TurboQuant: graph-side inverse WHT on attention output (undoes V rotation)
 
     ggml_build_forward_expand(gf, cur);
 
@@ -2068,25 +2091,20 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
-    // Q shape: (n_embd_head, n_head, n_tokens) — ne[0] divisible by 128
-    // No reshape/cont/matmul needed — the custom kernel handles groups internally
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-        if (q->ne[0] % 128 == 0) {
+    // Q shape: (n_embd_head, n_head, n_tokens) — ne[0] must be divisible by 64
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 64 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-            q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
+            ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+            q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
         }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation: O(d log d) inverse WHT on attention output
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
-        if (cur->ne[0] % 128 == 0) {
-            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-        }
-    }
+    // Note: TurboQuant inverse WHT is now applied inside build_attn_mha
+    // (after FA output, before v_mla) to handle both MLA and non-MLA models.
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
@@ -2168,6 +2186,15 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // TurboQuant: pre-rotate Q for K-only (MLA) attention
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 64 == 0) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+            q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+        }
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2236,23 +2263,19 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant Q rotation: rotate Q forward to match rotated K in cache
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-        if (q->ne[0] % 128 == 0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 64 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-            q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
+            ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+            q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
         }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation: inverse WHT on attention output
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
-        if (cur->ne[0] % 128 == 0) {
-            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-        }
-    }
+    // Note: TurboQuant inverse WHT is now applied inside build_attn_mha
+    // (after FA output, before v_mla) to handle both MLA and non-MLA models.
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
