@@ -65,8 +65,9 @@ command -v tar  &>/dev/null || err "tar is required. Install it and retry."
 OS=$(uname -s)
 ARCH=$(uname -m)
 
-[[ "$OS" == "Linux" ]]  || err "Unsupported OS: ${OS}. Only Linux is supported."
-[[ "$ARCH" == "x86_64" ]] || err "Unsupported architecture: ${ARCH}. Only x86_64 is supported."
+[[ "$OS" == "Linux" || "$OS" == "Darwin" ]]  || err "Unsupported OS: ${OS}. Only Linux and macOS are supported."
+[[ "$ARCH" == "x86_64" || "$ARCH" == "arm64" ]] || err "Unsupported architecture: ${ARCH}."
+
 
 detect_cuda() {
   if command -v nvidia-smi &>/dev/null; then
@@ -83,12 +84,20 @@ detect_cuda() {
   return 1
 }
 
-VARIANT="linux-cpu-x64"
-if detect_cuda; then
-  info "NVIDIA GPU detected → selecting CUDA variant"
-  VARIANT="linux-cuda-x64"
+VARIANT=""
+if [[ "$OS" == "Darwin" && "$ARCH" == "arm64" ]]; then
+  info "macOS Apple Silicon detected → selecting macos-arm64 variant"
+  VARIANT="macos-arm64"
+elif [[ "$OS" == "Linux" && "$ARCH" == "x86_64" ]]; then
+  if detect_cuda; then
+    info "Linux with NVIDIA GPU detected → selecting CUDA variant"
+    VARIANT="linux-cuda-x64"
+  else
+    info "Linux without NVIDIA GPU detected → selecting CPU-only variant"
+    VARIANT="linux-cpu-x64"
+  fi
 else
-  info "No NVIDIA GPU detected → selecting CPU-only variant"
+  err "No compatible variant found for OS=${OS} and ARCH=${ARCH}."
 fi
 
 log "Fetching latest release from GitHub..."
