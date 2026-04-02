@@ -1,0 +1,191 @@
+name: TurboQuant Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub release'
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: turboquant-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_COMMON: |
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+    -DGGML_BACKEND_DL=ON
+    -DGGML_NATIVE=OFF
+    -DGGML_CPU_ALL_VARIANTS=ON
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_BUILD_SERVER=ON
+
+jobs:
+
+  version:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version tag
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            BUILD=$(git rev-list --count HEAD)
+            HASH=$(git rev-parse --short=7 HEAD)
+            echo "tag=dev-b${BUILD}-${HASH}" >> $GITHUB_OUTPUT
+          fi
+
+
+  linux-cpu-x64:
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Package
+        id: pkg
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          FILENAME="turboquant-${TAG}-linux-cpu-x64.tar.gz"
+          cp LICENSE ./build/bin/
+          tar -czvf "${FILENAME}" \
+            --transform "s|^\./|turboquant-${TAG}/|" \
+            -C ./build/bin .
+          echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cpu-x64
+          path: ${{ steps.pkg.outputs.filename }}
+
+
+  linux-cuda-x64:
+    needs: version
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clean previous build
+        run: rm -rf build
+
+      - name: Build (CUDA)
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Package
+        id: pkg
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          FILENAME="turboquant-${TAG}-linux-cuda-x64.tar.gz"
+          cp LICENSE ./build/bin/
+          tar -czvf "${FILENAME}" \
+            --transform "s|^\./|turboquant-${TAG}/|" \
+            -C ./build/bin .
+          echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cuda-x64
+          path: ${{ steps.pkg.outputs.filename }}
+
+
+  release:
+    needs: [version, linux-cpu-x64, linux-cuda-x64]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    if: github.ref_type == 'tag' || github.event.inputs.create_release == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: "TurboQuant ${{ needs.version.outputs.tag }}"
+          body: |
+            ## TurboQuant ${{ needs.version.outputs.tag }}
+
+            Pre-compiled binaries for `llama-cpp-turboquant`.
+
+            ### One-click install
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/thodinh/llama-cpp-turboquant/master/install.sh | bash
+            ```
+
+            ### Available packages
+
+            | File | Platform | Backend |
+            |------|----------|---------|
+            | `turboquant-*-linux-cpu-x64.tar.gz` | Linux x86_64 | CPU only |
+            | `turboquant-*-linux-cuda-x64.tar.gz` | Linux x86_64 | CUDA + CPU |
+
+            ### Optimal run command (Qwen3.5-35B MoE)
+            ```bash
+            llama-cli -hf unsloth/Qwen3.5-35B-A3B-GGUF:Q2_K_XL -ngl 99 -c 4096 -fa on -rea off -cnv
+            ```
+          files: dist/**
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
