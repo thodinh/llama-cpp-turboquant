@@ -84,10 +84,15 @@ jobs:
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           FILENAME="turboquant-${TAG}-linux-cpu-x64.tar.gz"
-          cp LICENSE ./build/bin/
-          tar -czvf "${FILENAME}" \
-            --transform "s|^\./|turboquant-${TAG}/|" \
-            -C ./build/bin .
+          
+          mkdir -p "turboquant-${TAG}"
+          cp LICENSE "turboquant-${TAG}/"
+          for f in llama-cli llama-server llama-bench; do
+            [ -f "build/bin/$f" ] && cp "build/bin/$f" "turboquant-${TAG}/"
+          done
+          cp build/bin/*.so* "turboquant-${TAG}/" 2>/dev/null || true
+          
+          tar -czvf "${FILENAME}" "turboquant-${TAG}"
           echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
@@ -122,10 +127,16 @@ jobs:
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           FILENAME="turboquant-${TAG}-macos-arm64.tar.gz"
-          cp LICENSE ./build/bin/
-          tar -czvf "${FILENAME}" \
-            -s ",^./,turboquant-${TAG}/," \
-            -C ./build/bin .
+          
+          mkdir -p "turboquant-${TAG}"
+          cp LICENSE "turboquant-${TAG}/"
+          for f in llama-cli llama-server llama-bench; do
+            [ -f "build/bin/$f" ] && cp "build/bin/$f" "turboquant-${TAG}/"
+          done
+          cp build/bin/*.dylib "turboquant-${TAG}/" 2>/dev/null || true
+          cp build/bin/*.so* "turboquant-${TAG}/" 2>/dev/null || true
+          
+          tar -czvf "${FILENAME}" "turboquant-${TAG}"
           echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
@@ -167,10 +178,15 @@ jobs:
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           FILENAME="turboquant-${TAG}-linux-cuda-x64.tar.gz"
-          cp LICENSE ./build/bin/
-          tar -czvf "${FILENAME}" \
-            --transform "s|^\./|turboquant-${TAG}/|" \
-            -C ./build/bin .
+          
+          mkdir -p "turboquant-${TAG}"
+          cp LICENSE "turboquant-${TAG}/"
+          for f in llama-cli llama-server llama-bench; do
+            [ -f "build/bin/$f" ] && cp "build/bin/$f" "turboquant-${TAG}/"
+          done
+          cp build/bin/*.so* "turboquant-${TAG}/" 2>/dev/null || true
+          
+          tar -czvf "${FILENAME}" "turboquant-${TAG}"
           echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
