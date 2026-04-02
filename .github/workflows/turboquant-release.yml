@@ -83,15 +83,13 @@ jobs:
         id: pkg
         run: |
           TAG="${{ needs.version.outputs.tag }}"
-          FILENAME="turboquant-${TAG}-linux-cpu-x64.tar.gz"
-          
+          FILENAME="turboquant-${TAG}-linux-cpu-x64.tar.gz"          
           mkdir -p "turboquant-${TAG}"
           cp LICENSE "turboquant-${TAG}/"
           for f in llama-cli llama-server llama-bench; do
             [ -f "build/bin/$f" ] && cp "build/bin/$f" "turboquant-${TAG}/"
           done
           cp build/bin/*.so* "turboquant-${TAG}/" 2>/dev/null || true
-          
           tar -czvf "${FILENAME}" "turboquant-${TAG}"
           echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
@@ -178,14 +176,12 @@ jobs:
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           FILENAME="turboquant-${TAG}-linux-cuda-x64.tar.gz"
-          
           mkdir -p "turboquant-${TAG}"
           cp LICENSE "turboquant-${TAG}/"
           for f in llama-cli llama-server llama-bench; do
             [ -f "build/bin/$f" ] && cp "build/bin/$f" "turboquant-${TAG}/"
           done
           cp build/bin/*.so* "turboquant-${TAG}/" 2>/dev/null || true
-          
           tar -czvf "${FILENAME}" "turboquant-${TAG}"
           echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
